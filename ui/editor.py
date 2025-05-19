@@ -1,135 +1,202 @@
+# ui/editor.py
+
 import tkinter as tk
-from tkinter import messagebox
+from tkinter import ttk, messagebox
 import sqlite3
 import subprocess
 import tempfile
 import os
-from datetime import datetime
 import sys
-
+from datetime import datetime
+from pygments import lex
+from pygments.lexers import PythonLexer
+from pygments.styles import get_style_by_name
+import difflib
 
 def abrir_editor(usuario, questao_id):
-    janela = tk.Toplevel()
-    janela.title(f"Editor – Questão {questao_id}")
-    janela.geometry("950x700")
-
-    # Busca enunciado
+    # --- Carrega dados da questão e casos de teste ---
     conn = sqlite3.connect("database/db.sqlite3")
-    cursor = conn.cursor()
-    cursor.execute("SELECT enunciado FROM questoes WHERE id = ?", (questao_id,))
-    row = cursor.fetchone()
+    cur = conn.cursor()
+    cur.execute("SELECT enunciado FROM questoes WHERE id = ?", (questao_id,))
+    row = cur.fetchone()
+    cur.execute("SELECT entrada, saida_esperada FROM test_cases WHERE questao_id = ?", (questao_id,))
+    casos = cur.fetchall()
     conn.close()
-    if not row:
-        messagebox.showerror("Erro", "Questão não encontrada.")
+
+    if not row or not casos:
+        messagebox.showerror("Erro", "Questão ou casos de teste não encontrados.")
         return
     enunciado = row[0]
 
-    tk.Label(janela, text="Enunciado:", font=("Arial", 14)).pack(pady=(10,0))
-    tk.Message(janela, text=enunciado, width=900).pack(pady=(0,10))
+    # --- Janela principal ---
+    win = tk.Toplevel()
+    win.title(f"Editor – Questão {questao_id}")
+    win.geometry("950x700")
+    win.configure(bg="#282a36")
+    fullscreen = False
 
-    # Busca casos de teste
-    conn = sqlite3.connect("database/db.sqlite3")
-    cursor = conn.cursor()
-    cursor.execute("""
-        SELECT entrada, saida_esperada
-        FROM test_cases
-        WHERE questao_id = ?
-    """, (questao_id,))
-    casos = cursor.fetchall()
-    conn.close()
-    if not casos:
-        messagebox.showerror("Erro", "Nenhum caso de teste cadastrado para esta questão.")
-        return
+    def toggle_fullscreen(event=None):
+        nonlocal fullscreen
+        fullscreen = not fullscreen
+        win.attributes("-fullscreen", fullscreen)
 
-    # Editor básico (lembra de já ter syntax, linhas etc)
-    editor = tk.Text(janela, font=("Consolas", 12), height=20, wrap="none")
-    editor.pack(fill="both", expand=True, padx=10, pady=5)
+    win.bind("<F11>", toggle_fullscreen)
 
-    resultado_label = tk.Label(janela, text="", font=("Arial", 12))
-    resultado_label.pack(pady=10)
+    # --- Toolbar ---
+    toolbar = ttk.Frame(win)
+    toolbar.pack(fill="x", pady=2)
+    btn_run   = ttk.Button(toolbar, text="▶️ Run",       command=lambda: run_code())
+    btn_clear = ttk.Button(toolbar, text="✖ Clear",     command=lambda: clear_code())
+    btn_fs    = ttk.Button(toolbar, text="⛶ Fullscreen", command=toggle_fullscreen)
+    for b in (btn_run, btn_clear, btn_fs):
+        b.pack(side="left", padx=4)
 
-    def executar_codigo():
-        codigo = editor.get("1.0", tk.END)
+    # --- Container de editor + linhas ---
+    container = ttk.Frame(win)
+    container.pack(fill="both", expand=True, padx=5, pady=5)
 
-        # Bloqueio básico
-        proibidos = ["import os", "open(", "__import__", "exec(", "eval(", "exit("]
-        if any(p in codigo for p in proibidos):
-            resultado_label.config(text="❌ Uso de comando proibido!", fg="red")
-            salvar_submissao(usuario[0], questao_id, codigo, "", "bloqueado")
+    ln = tk.Text(container, width=4, padx=4, takefocus=0, border=0,
+                 bg="#282a36", fg="#6272a4", state="disabled")
+    ln.pack(side="left", fill="y")
+
+    editor = tk.Text(container, font=("Consolas",12), bg="#282a36", fg="#f8f8f2",
+                     insertbackground="white", undo=True, wrap="none")
+    editor.pack(side="left", fill="both", expand=True)
+
+    scroll = ttk.Scrollbar(container,
+        command=lambda *a: (editor.yview(*a), ln.yview(*a)))
+    scroll.pack(side="right", fill="y")
+    editor.config(yscrollcommand=scroll.set)
+    ln.config(yscrollcommand=scroll.set)
+
+    # --- Syntax Highlight (Dracula) ---
+    style = get_style_by_name("dracula")
+    for ttype, spec in style:
+        if spec["color"]:
+            editor.tag_config(str(ttype), foreground="#" + spec["color"])
+
+    # --- Status Bar ---
+    status = ttk.Frame(win)
+    status.pack(fill="x")
+    cursor_lbl = ttk.Label(status, text="Ln 1, Col 0",
+                           background="#282a36", foreground="#f8f8f2")
+    result_lbl = ttk.Label(status, text="",
+                           background="#282a36", foreground="#50fa7b")
+    cursor_lbl.pack(side="left", padx=5)
+    result_lbl.pack(side="left", padx=20)
+
+    # --- Funções de apoio ---
+    def update_lines(event=None):
+        total = int(editor.index("end-1c").split(".")[0])
+        nums  = "\n".join(str(i) for i in range(1, total+1))
+        ln.config(state="normal")
+        ln.delete("1.0","end")
+        ln.insert("1.0", nums)
+        ln.config(state="disabled")
+
+    def color_syntax(event=None):
+        code = editor.get("1.0","end-1c")
+        editor.mark_set("range_start","1.0")
+        for tag in editor.tag_names():
+            editor.tag_remove(tag,"1.0","end")
+        for ttype, val in lex(code, PythonLexer()):
+            if not val:
+                continue
+            start = editor.index("range_start")
+            end   = f"{start}+{len(val)}c"
+            editor.tag_add(str(ttype), start, end)
+            editor.mark_set("range_start", end)
+
+    def update_cursor(event=None):
+        idx = editor.index("insert")
+        line, col = idx.split(".")
+        cursor_lbl.config(text=f"Ln {line}, Col {col}")
+
+    def clear_code():
+        editor.delete("1.0","end")
+        result_lbl.config(text="")
+        update_lines(); color_syntax()
+
+    def run_code():
+        code = editor.get("1.0","end")
+        forbidden = ("import os", "open(", "exec(", "eval(", "exit(")
+        if any(p in code for p in forbidden):
+            result_lbl.config(text="❌ Comando proibido", foreground="#ff5555")
             return
 
-        # Cria arquivo temporário só com o código
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".py", mode="w", encoding="utf-8") as tmp:
-            tmp.write(codigo)
-            temp_path = tmp.name
+        tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".py",
+                                          mode="w", encoding="utf-8")
+        tmp.write(f"import sys, io\nsys.stdin = io.StringIO('''{casos[0][0]}''')\n")
+        tmp.write(code)
+        tmp.close()
 
-        outputs = []
-        passou_tudo = True
-        caso_falha = None
-
-        # Executa para cada caso
-        for idx, (inp, exp) in enumerate(casos, start=1):
+        outputs = []; ok = True; fail = 0
+        for i, (inp, exp) in enumerate(casos, start=1):
             try:
                 res = subprocess.run(
-                    [sys.executable, temp_path],
-                    input=inp,
-                    capture_output=True,
-                    text=True,
-                    timeout=3
+                    [sys.executable, tmp.name],
+                    input=inp, capture_output=True, text=True, timeout=3
                 )
                 out = res.stdout.strip()
             except subprocess.TimeoutExpired:
-                passou_tudo = False
-                caso_falha = idx
-                outputs.append("TIMEOUT")
-                break
+                ok=False; fail=i; outputs.append("TIMEOUT"); break
             outputs.append(out)
             if out != exp.strip():
-                passou_tudo = False
-                caso_falha = idx
-                break
+                ok=False; fail=i; break
 
-        # Limpa arquivo temporário
-        os.remove(temp_path)
+        try:
+            os.remove(tmp.name)
+        except OSError:
+            pass
 
-        # Mostra resultado no UI
-        if passou_tudo:
-            resultado_label.config(
-                text=f"✅ Todos os {len(casos)} casos passaram!",
-                fg="green"
-            )
-            status = "correto"
+        if ok:
+            result_lbl.config(text=f"✅ {len(casos)} OK", foreground="#50fa7b")
+            status_txt = "correto"
         else:
-            esperado = casos[caso_falha-1][1]
-            obtido = outputs[caso_falha-1]
-            resultado_label.config(
-                text=(
-                    f"❌ Falha no caso {caso_falha}\n"
-                    f"Esperado: {esperado}\nObtido: {obtido}"
-                ),
-                fg="red"
+            esperado = casos[fail-1][1].strip()
+            obtido   = outputs[fail-1]
+            hint = ""
+            if esperado == obtido.strip():
+                hint = "Verifique espaços/linhas."
+            elif any("invalid literal for int" in o for o in outputs):
+                hint = "Use int(input())."
+            else:
+                diff = "\n".join(difflib.ndiff(
+                    esperado.splitlines(),
+                    obtido.splitlines()
+                ))
+                hint = f"Diferenças:\n{diff}"
+            result_lbl.config(
+                text=f"❌ Caso {fail} falhou\n{hint}",
+                foreground="#ff5555"
             )
-            status = "incorreto" if outputs[caso_falha-1] not in ("TIMEOUT",) else "timeout"
+            status_txt = "incorreto" if outputs[fail-1] != "TIMEOUT" else "timeout"
 
-        # Salva no banco (concatena todas as saídas)
-        salvar_submissao(
-            usuario[0],
-            questao_id,
-            codigo,
-            "\n".join(outputs),
-            status
-        )
-
-    def salvar_submissao(id_aluno, id_questao, codigo, saida, resultado):
-        conn = sqlite3.connect("database/db.sqlite3")
-        cursor = conn.cursor()
-        cursor.execute("""
+        # Salva submissão
+        conn2 = sqlite3.connect("database/db.sqlite3")
+        cur2 = conn2.cursor()
+        cur2.execute("""
             INSERT INTO submissoes
             (id_aluno, id_questao, codigo, saida_obtida, resultado, data_hora)
             VALUES (?, ?, ?, ?, ?, ?)
-        """, (id_aluno, id_questao, codigo, saida, resultado, datetime.now().isoformat()))
-        conn.commit()
-        conn.close()
+        """, (
+            usuario[0],
+            questao_id,
+            code,
+            "\n".join(outputs),
+            status_txt,
+            datetime.now().isoformat()
+        ))
+        conn2.commit()
+        conn2.close()
 
-    tk.Button(janela, text="Executar", command=executar_codigo).pack(pady=5)
-    janela.mainloop()
+    # --- Bindings ---
+    editor.bind("<KeyRelease>", update_lines)
+    editor.bind("<KeyRelease>", color_syntax, add='+')
+    editor.bind("<KeyRelease>", update_cursor, add='+')
+    editor.bind("<ButtonRelease>", update_cursor)
+    editor.bind("<MouseWheel>",    update_lines)
+
+    # --- Inicialização ---
+    update_lines(); color_syntax(); update_cursor()
+    win.mainloop()
